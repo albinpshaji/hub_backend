@@ -510,6 +510,49 @@ async def _process_chat_message_and_stream(
                 system_instruction += (
                     f"\n\n--- CONVERSATION SUMMARY ---\n{session.summary}\n----------------------------"
                 )
+    else:
+        # Non-RAG mode: if specific document_ids are provided, read and append their full text directly as context
+        if document_ids:
+            try:
+                # Retrieve documents that belong to current user
+                allowed_docs_result = await db.execute(
+                    select(Document).where(
+                        Document.id.in_(document_ids),
+                        Document.user_id == current_user.id,
+                    )
+                )
+                allowed_docs = allowed_docs_result.scalars().all()
+                
+                full_texts = []
+                for doc in allowed_docs:
+                    doc_text = await ai_client.extract_text(doc.storage_path, doc.file_type)
+                    if doc_text.strip():
+                        # Truncate each document's text to a reasonable limit (e.g. 20,000 characters) to prevent token window overflow
+                        truncated_text = doc_text.strip()
+                        if len(truncated_text) > 20000:
+                            truncated_text = truncated_text[:20000] + "\n... [Truncated due to context window constraints] ..."
+                        full_texts.append(f"--- DOCUMENT: {doc.filename} ---\n{truncated_text}")
+                
+                if full_texts:
+                    context = "\n\n".join(full_texts)
+                    system_instruction = (
+                        "You are an assistant answering questions using the following document context.\n"
+                        "Answer based on the context. If the context does not contain the answer, "
+                        "say so clearly but still try to help based on general knowledge.\n\n"
+                        f"--- DOCUMENT CONTEXT ---\n{context}\n------------------------"
+                    )
+                    if session.summary:
+                        system_instruction += (
+                            f"\n\n--- CONVERSATION SUMMARY ---\n{session.summary}\n----------------------------"
+                        )
+            except Exception as exc:
+                logger.error("Failed to extract full text context in non-RAG mode: %s", exc)
+
+    # 6.4. Pre-compute has_visual_chunks so it can be used both here and in event_generator.
+    has_visual_chunks = any(
+        "[Image Description" in item.get("text", "")
+        for item in matching_data
+    )
 
     # 6.5. Inject thinking mode instruction.
     if thinking_mode:
@@ -518,8 +561,19 @@ async def _process_chat_message_and_stream(
             "Write at least 2-3 sentences explaining your thought process inside the tags."
         )
     else:
+        # Only append "Respond directly" if web search or visual reinspection is not active, to avoid contradicting tool calling instructions.
+        if not (web_search or (use_rag and has_visual_chunks)):
+            system_instruction += (
+                "\n\nRespond directly"
+            )
+
+    # 6.6. When web search is enabled, add an explicit instruction so the model knows to use the tool.
+    if web_search:
         system_instruction += (
-            "\n\nRespond directly"
+            "\n\nIMPORTANT: You have access to a 'web_search' tool. For ANY question about current events, "
+            "live scores, recent news, real-time data, or facts you are unsure about, you MUST call the "
+            "web_search tool FIRST before attempting to answer. Do NOT guess or rely on your training data "
+            "for time-sensitive or factual queries. Always search the web first."
         )
 
     # 7. Assemble the full message list for the LLM.
@@ -541,12 +595,6 @@ async def _process_chat_message_and_stream(
         # A. Emit source citations as the very first SSE event (RAG only).
         if matching_data or meta_data:
             yield f"data: {json.dumps({'sources': matching_data, 'search_metadata': meta_data})}\n\n"
-
-        # Check if the retrieved context contains any visual descriptions
-        has_visual_chunks = any(
-            "[Image Description" in item.get("text", "")
-            for item in matching_data
-        )
 
         direct_content = None
 
@@ -611,15 +659,15 @@ async def _process_chat_message_and_stream(
             try:
                 # Execute up to 3 sequential tool call turns
                 max_turns = 3
+                turns_used = 0
                 executed_tool_calls = set()
-                parser = ThinkTagParser(thinking_mode=thinking_mode)
-                
                 parser = ThinkTagParser(thinking_mode=thinking_mode)
                 
                 for turn in range(max_turns):
                     if "pytest" not in sys.modules and request and await request.is_disconnected():
                         logger.info("Client disconnected during tools turn. Aborting.")
                         break
+                    turns_used += 1
                     response_msg = await ai_client.chat_with_tools(ollama_messages, tools=tools, think=thinking_mode)
                     
                     # Yield intermediate thinking if the model wrote any
@@ -678,10 +726,6 @@ async def _process_chat_message_and_stream(
                             if func_name == "reinspect_document_page":
                                 doc_id_str = args.get("document_id")
                                 page_num = args.get("page_number")
-                                specific_question = args.get("specific_question") or ""
-                                # Yield status update to frontend
-                                yield f"data: {json.dumps({'status': f'👁️ Re-inspecting page {page_num or 1}...'})}\n\n"
-                                specific_question = args.get("specific_question") or ""
                                 # Yield status update to frontend
                                 yield f"data: {json.dumps({'status': f'👁️ Re-inspecting page {page_num or 1}...'})}\n\n"
                                 
@@ -791,11 +835,9 @@ async def _process_chat_message_and_stream(
                                 if query_arg:
                                     # Yield status update to frontend
                                     yield f"data: {json.dumps({'status': f'🔍 Searching the web for \"{query_arg}\"...'})}\n\n"
-                                    # Yield status update to frontend
-                                    yield f"data: {json.dumps({'status': f'🔍 Searching the web for \"{query_arg}\"...'})}\n\n"
                                     from app.ai.services.search_service import unified_web_search
                                     try:
-                                        tool_result = await unified_web_search(query_arg)
+                                        tool_result = await unified_web_search(query_arg, max_results=5)
                                     except Exception as e:
                                         logger.error("Error in unified_web_search: %s", e, exc_info=True)
                                         tool_result = f"Error during web search: {str(e)}"
@@ -815,18 +857,17 @@ async def _process_chat_message_and_stream(
                     else:
                         # No tool calls, the model has finished reasoning.
                         # The thinking was already streamed above, so we only need to stream content.
-                        # No tool calls, the model has finished reasoning.
-                        # The thinking was already streamed above, so we only need to stream content.
                         direct_content = response_msg.get("content", "")
                         break
+
+                logger.info("🛠️ Tool calling loop finished. Total turns used: %d", turns_used)
+                print(f"\n[AI Search] Tool calling loop finished. Total turns used: {turns_used}\n", flush=True)
             except Exception as exc:
                 logger.error("Failed to execute tool-calling loop: %s", exc, exc_info=True)
                 direct_content = None
 
         # B. Stream tokens from the AI module.
         try:
-            if 'parser' not in locals():
-                parser = ThinkTagParser(thinking_mode=thinking_mode)
             if 'parser' not in locals():
                 parser = ThinkTagParser(thinking_mode=thinking_mode)
             if direct_content is not None:
