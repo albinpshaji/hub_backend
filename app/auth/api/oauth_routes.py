@@ -97,11 +97,18 @@ async def google_token_login(
         db.add(user)
         await db.commit()
         await db.refresh(user)
-    elif picture and not user.avatar_url:
-        # Update avatar from Google if they don't have one yet
-        user.avatar_url = picture
-        await db.commit()
-        await db.refresh(user)
+    else:
+        # Update name and avatar from Google if they differ or were set to defaults
+        updated = False
+        if full_name and (user.full_name == "string" or not user.full_name):
+            user.full_name = full_name
+            updated = True
+        if picture and (not user.avatar_url or user.avatar_url != picture):
+            user.avatar_url = picture
+            updated = True
+        if updated:
+            await db.commit()
+            await db.refresh(user)
 
     if user.status == "pending":
         raise HTTPException(
@@ -173,4 +180,12 @@ async def google_login_mobile(
             "name": user.full_name,
             "email": user.email,
         }
+    }
+
+
+@router.get("/config")
+async def get_auth_config():
+    from app.config import settings
+    return {
+        "google_client_id": settings.google_client_id
     }
